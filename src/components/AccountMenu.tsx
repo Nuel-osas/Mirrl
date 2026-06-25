@@ -43,7 +43,6 @@ export function AccountMenu({
           }`}
         >
           Mainnet
-          <span className="rounded bg-border-strong px-1 py-0.5 text-[9px] uppercase tracking-wide text-muted-2">soon</span>
         </button>
       </div>
 

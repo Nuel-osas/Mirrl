@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { ethers } from "ethers";
 import { createZGComputeNetworkBroker } from "@0gfoundation/0g-compute-ts-sdk";
-import { OG } from "@/lib/og";
+import { rpcFor, type Network } from "@/lib/og";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -13,11 +13,13 @@ type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 // Set OG_PRIVATE_KEY (a funded 0G testnet wallet) to hit the live network;
 // without it, Mirrl responds in local demo mode so the UI is fully usable.
 export async function POST(req: NextRequest) {
-  const { messages, model, memory } = (await req.json()) as {
+  const { messages, model, memory, network } = (await req.json()) as {
     messages: ChatMessage[];
     model?: string;
     memory?: string[];
+    network?: Network;
   };
+  const net: Network = network === "mainnet" ? "mainnet" : "testnet";
 
   const system: ChatMessage = {
     role: "system",
@@ -41,7 +43,7 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const provider = new ethers.JsonRpcProvider(OG.testnet.rpc);
+    const provider = new ethers.JsonRpcProvider(rpcFor(net));
     const wallet = new ethers.Wallet(key, provider);
     const broker = await createZGComputeNetworkBroker(wallet);
 
