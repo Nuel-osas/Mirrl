@@ -28,12 +28,27 @@ type Store = {
   network: Network;
   setNetwork: (n: Network) => void;
   signedIn: boolean;
-  toggleAuth: () => void;
+  address: string | null;
+  setWallet: (addr: string | null) => void;
+  // sign-in gating
+  signInOpen: boolean;
+  openSignIn: () => void;
+  closeSignIn: () => void;
+  requireAuth: () => boolean;
+  // post-sign-in faucet prompt
+  claimOpen: boolean;
+  openClaim: () => void;
+  closeClaim: () => void;
+  // profile / funding panel
+  profileOpen: boolean;
+  openProfile: () => void;
+  closeProfile: () => void;
   model: string;
   setModel: (m: string) => void;
   memories: Memory[];
   addMemory: (text: string, tag?: string) => void;
   removeMemory: (id: string) => void;
+  commitMemory: () => void;
   sessions: ChatSession[];
   activeId: string | null;
   newChat: () => void;
@@ -70,6 +85,10 @@ export function MirrlProvider({ children }: { children: React.ReactNode }) {
   const [theme, setTheme] = useState<Theme>("dark");
   const [network, setNetwork] = useState<Network>("mainnet");
   const [signedIn, setSignedIn] = useState(false);
+  const [address, setAddress] = useState<string | null>(null);
+  const [signInOpen, setSignInOpen] = useState(false);
+  const [claimOpen, setClaimOpen] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
   const [model, setModelState] = useState("");
   const [memories, setMemories] = useState<Memory[]>([]);
   const [sessions, setSessions] = useState<ChatSession[]>([]);
@@ -79,36 +98,59 @@ export function MirrlProvider({ children }: { children: React.ReactNode }) {
   const sessionsRef = useRef<ChatSession[]>([]);
   const activeIdRef = useRef<string | null>(null);
 
-  // hydrate everything from the database
+  // On mount, load only UI prefs (theme/network/model). The actual user data
+  // (memories, sessions) is loaded when signed in and cleared when signed out —
+  // so signing out returns to a clean anon page. Sign-in state itself comes from
+  // the connected wallet / Google via <IdentitySync/>, not from prefs.
   useEffect(() => {
     (async () => {
       try {
-        const [pr, mr, sr] = await Promise.all([
-          fetch("/api/prefs").then((r) => r.json()),
-          fetch("/api/memories").then((r) => r.json()),
-          fetch("/api/sessions").then((r) => r.json()),
-        ]);
-        const p = pr?.prefs;
+        const p = (await fetch("/api/prefs").then((r) => r.json()))?.prefs;
         if (p) {
           setTheme(p.theme);
           setNetwork(p.network);
-          setSignedIn(p.signedIn);
           setModelState(p.model);
-          activeIdRef.current = p.activeSession ?? null;
-          setActiveId(p.activeSession ?? null);
         }
-        const ms: Memory[] = mr?.memories ?? [];
-        setMemories(ms);
-        const ss: ChatSession[] = sr?.sessions ?? [];
-        sessionsRef.current = ss;
-        setSessions(ss);
       } catch {
-        // offline / first-run: start empty
+        // offline / first-run: defaults
       } finally {
         setReady(true);
       }
     })();
   }, []);
+
+  // Load the user's memories + sessions; called on sign-in.
+  const loadUserData = useCallback(async () => {
+    try {
+      const [mr, sr, pr] = await Promise.all([
+        fetch("/api/memories").then((r) => r.json()),
+        fetch("/api/sessions").then((r) => r.json()),
+        fetch("/api/prefs").then((r) => r.json()),
+      ]);
+      setMemories(mr?.memories ?? []);
+      const ss: ChatSession[] = sr?.sessions ?? [];
+      sessionsRef.current = ss;
+      setSessions(ss);
+      const active = pr?.prefs?.activeSession ?? null;
+      activeIdRef.current = active;
+      setActiveId(active);
+    } catch {}
+  }, []);
+
+  // Tie data visibility to auth: load on sign-in, wipe on sign-out.
+  useEffect(() => {
+    if (signedIn) {
+      loadUserData();
+    } else {
+      setMemories([]);
+      setSessions([]);
+      sessionsRef.current = [];
+      setActiveId(null);
+      activeIdRef.current = null;
+      setClaimOpen(false);
+      setProfileOpen(false);
+    }
+  }, [signedIn, loadUserData]);
 
   // apply theme to the document
   useEffect(() => {
@@ -141,13 +183,37 @@ export function MirrlProvider({ children }: { children: React.ReactNode }) {
     [savePrefs],
   );
 
-  const toggleAuth = useCallback(() => {
-    setSignedIn((v) => {
-      const next = !v;
-      savePrefs({ signedIn: next });
-      return next;
-    });
-  }, [savePrefs]);
+  // Driven by the signed-in Google user's custodial wallet via <IdentitySync/>.
+  const setWallet = useCallback(
+    (addr: string | null) => {
+      setAddress(addr);
+      setSignedIn((prev) => {
+        const next = !!addr;
+        if (next !== prev) savePrefs({ signedIn: next });
+        return next;
+      });
+    },
+    [savePrefs],
+  );
+
+  // ----- sign-in gate -----
+  const openSignIn = useCallback(() => setSignInOpen(true), []);
+  const closeSignIn = useCallback(() => setSignInOpen(false), []);
+  const requireAuth = useCallback(() => {
+    if (signedIn) return true;
+    setSignInOpen(true);
+    return false;
+  }, [signedIn]);
+
+  const openClaim = useCallback(() => setClaimOpen(true), []);
+  const closeClaim = useCallback(() => setClaimOpen(false), []);
+  const openProfile = useCallback(() => setProfileOpen(true), []);
+  const closeProfile = useCallback(() => setProfileOpen(false), []);
+
+  // auto-dismiss the prompt the moment the user signs in
+  useEffect(() => {
+    if (signedIn) setSignInOpen(false);
+  }, [signedIn]);
 
   // ----- memories -----
   const addMemory = useCallback((text: string, tag = "everything") => {
@@ -162,6 +228,21 @@ export function MirrlProvider({ children }: { children: React.ReactNode }) {
     setMemories((prev) => prev.filter((m) => m.id !== id));
     send(`/api/memories?id=${encodeURIComponent(id)}`, "DELETE");
   }, []);
+
+  // Seal the working cache to 0G Storage, then refresh (the cache is now cleared).
+  const commitMemory = useCallback(async () => {
+    if (!signedIn) return;
+    try {
+      await fetch("/api/memory/commit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ network }),
+      });
+      const r = await fetch("/api/memories");
+      const d = await r.json();
+      setMemories(d.memories ?? []);
+    } catch {}
+  }, [signedIn, network]);
 
   // ----- chat sessions -----
   const commitSessions = useCallback((next: ChatSession[]) => {
@@ -221,8 +302,11 @@ export function MirrlProvider({ children }: { children: React.ReactNode }) {
   return (
     <Ctx.Provider
       value={{
-        ready, theme, toggleTheme, network, setNetwork: setNetworkPersist, signedIn, toggleAuth,
-        model, setModel, memories, addMemory, removeMemory,
+        ready, theme, toggleTheme, network, setNetwork: setNetworkPersist, signedIn, address, setWallet,
+        signInOpen, openSignIn, closeSignIn, requireAuth,
+        claimOpen, openClaim, closeClaim,
+        profileOpen, openProfile, closeProfile,
+        model, setModel, memories, addMemory, removeMemory, commitMemory,
         sessions, activeId, newChat, openChat, saveChat, deleteChat,
       }}
     >

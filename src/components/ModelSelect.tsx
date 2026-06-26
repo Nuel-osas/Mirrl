@@ -16,23 +16,29 @@ export function ModelSelect({
 }) {
   const { network } = useMirrl();
   const [models, setModels] = useState<OgModel[]>([]);
+  const [funded, setFunded] = useState<Set<string>>(new Set());
   const [open, setOpen] = useState(false);
   const [source, setSource] = useState<string>("");
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let cancelled = false;
-    fetch(`/api/models?network=${network}`)
-      .then((r) => r.json())
-      .then((d: { source: string; models: OgModel[] }) => {
+    Promise.all([
+      fetch(`/api/models?network=${network}`).then((r) => r.json()),
+      fetch(`/api/models/funded?network=${network}`).then((r) => r.json()).catch(() => ({ funded: [] })),
+    ])
+      .then(([d, f]: [{ source: string; models: OgModel[] }, { funded: string[] }]) => {
         if (cancelled) return;
-        setModels(d.models || []);
+        const list = d.models || [];
+        const fundedSet = new Set(f.funded || []);
+        setModels(list);
         setSource(d.source);
-        // auto-select the best available model if current isn't offered here
-        const has = d.models?.some((m) => m.model === value);
-        if (d.models?.length && !has) {
-          const best = bestAvailable(d.models);
-          const pick = d.models.find((m) => m.model === best);
+        setFunded(fundedSet);
+        // default selection: prefer a funded ("ready") model, else best available
+        const has = list.some((m) => m.model === value);
+        if (list.length && !has) {
+          const ready = list.find((m) => fundedSet.has(m.model))?.model;
+          const pick = list.find((m) => m.model === (ready ?? bestAvailable(list)));
           if (pick) onChange(pick);
         }
       })
@@ -73,9 +79,20 @@ export function ModelSelect({
         )}
         <span className="flex-1 min-w-0">
           <span className="block truncate text-[13px] text-foreground">{m.label}</span>
-          <span className="block truncate text-[10px] text-muted-2">{m.note ?? m.model}</span>
+          <span className="block truncate text-[10px] text-muted-2">
+            {funded.has(m.model) ? "ready" : m.note ?? m.model}
+          </span>
         </span>
-        {m.verifiable && <ShieldCheck size={13} className="shrink-0 text-emerald-400/80" />}
+        {funded.has(m.model) ? (
+          <span className="shrink-0 rounded-full bg-emerald-400/15 px-1.5 py-0.5 text-[9px] font-medium text-emerald-400">ready</span>
+        ) : (
+          <span
+            className="shrink-0 rounded-full bg-surface-2 px-1.5 py-0.5 text-[9px] font-medium text-muted-2"
+            title="Not funded yet — using this enables it with ~1 0G from your wallet (one-time)"
+          >
+            ~1 0G
+          </span>
+        )}
         {m.model === value && <Check size={14} className="shrink-0 text-foreground" />}
       </button>
     );
@@ -87,13 +104,13 @@ export function ModelSelect({
         onClick={() => setOpen((o) => !o)}
         className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted hover:text-foreground hover:bg-surface-2 transition-colors"
       >
-        <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-        <span className="max-w-[150px] truncate">{current?.label ?? value ?? "Select model"}</span>
-        <ChevronDown size={13} className="opacity-60" />
+        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400" />
+        <span className="max-w-[140px] truncate sm:max-w-[150px]">{current?.label ?? value ?? "Select model"}</span>
+        <ChevronDown size={13} className="shrink-0 opacity-60" />
       </button>
 
       {open && (
-        <div className="absolute bottom-full mb-2 left-0 w-72 rounded-xl border border-border-strong bg-surface p-1.5 shadow-2xl shadow-black/50 z-50">
+        <div className="absolute bottom-full left-0 mb-2 z-50 w-[min(22rem,calc(100vw-1.5rem))] rounded-xl border border-border-strong bg-surface p-1.5 shadow-2xl shadow-black/50 sm:left-auto sm:right-0 sm:w-72">
           <div className="flex items-center justify-between px-2 py-1.5">
             <span className="text-[10px] font-medium uppercase tracking-wider text-muted-2">
               0G Compute · {network}
@@ -123,8 +140,13 @@ export function ModelSelect({
             )}
           </div>
 
-          <div className="border-t border-border mt-1 px-2 py-1.5 text-[10px] text-muted-2 flex items-center gap-1.5">
-            <ShieldCheck size={11} className="text-emerald-400/80" /> TEE-verifiable · runs on 0G
+          <div className="border-t border-border mt-1 px-2 py-1.5 text-[10px] leading-relaxed text-muted-2">
+            <span className="flex items-center gap-1.5">
+              <ShieldCheck size={11} className="text-emerald-400/80" /> TEE-verifiable · runs on 0G
+            </span>
+            <span className="mt-0.5 block">
+              <span className="text-emerald-400">ready</span> = funded · others use ~1 0G on first run. Reclaim anytime in Wallet.
+            </span>
           </div>
         </div>
       )}

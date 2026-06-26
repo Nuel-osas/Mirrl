@@ -14,6 +14,7 @@ export const OG = {
   mainnet: {
     name: "0G Mainnet",
     rpc: "https://evmrpc.0g.ai",
+    storageIndexer: "https://indexer-storage-turbo.0g.ai",
     chainId: 16661,
   },
 } as const;
@@ -22,6 +23,10 @@ export type Network = "testnet" | "mainnet";
 
 export function rpcFor(network: Network): string {
   return network === "mainnet" ? OG.mainnet.rpc : OG.testnet.rpc;
+}
+
+export function indexerFor(network: Network): string {
+  return network === "mainnet" ? OG.mainnet.storageIndexer : OG.testnet.storageIndexer;
 }
 
 export type OgModel = {
