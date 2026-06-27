@@ -1,11 +1,10 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
-import { BookText } from "lucide-react";
 import { Toaster } from "sonner";
 import "./globals.css";
 import { MirrlProvider } from "@/lib/store";
 import { AuthProvider } from "@/lib/auth";
-import { TopNav } from "@/components/TopNav";
+import { AppShell } from "@/components/AppShell";
 import { IdentitySync } from "@/components/IdentitySync";
 import { SignInModal } from "@/components/SignInModal";
 import { ClaimModal } from "@/components/ClaimModal";
@@ -56,18 +55,7 @@ export default function RootLayout({
               <ClaimModal />
               <ProfileModal />
               <Toaster theme="dark" position="bottom-center" toastOptions={{ style: { background: "var(--surface)", border: "1px solid var(--border-strong)", color: "var(--foreground)" } }} />
-              <div className="flex h-screen flex-col bg-background text-foreground">
-                <TopNav />
-                <div className="relative flex flex-1 overflow-hidden [&>*]:min-w-0 [&>*]:flex-1">{children}</div>
-              </div>
-              <a
-                href="https://docs.0g.ai"
-                target="_blank"
-                rel="noreferrer"
-                className="fixed bottom-6 right-4 z-40 hidden sm:flex items-center gap-1.5 rounded-lg border border-border bg-surface/80 px-3 py-2 text-xs text-muted backdrop-blur hover:text-foreground transition-colors"
-              >
-                <BookText size={14} /> Docs
-              </a>
+              <AppShell>{children}</AppShell>
           </MirrlProvider>
         </AuthProvider>
       </body>
