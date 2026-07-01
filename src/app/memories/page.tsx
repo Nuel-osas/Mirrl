@@ -4,7 +4,6 @@ import { useMemo, useState } from "react";
 import {
   LayoutGrid,
   Activity,
-  RefreshCw,
   Plus,
   Search,
   Trash2,
@@ -12,8 +11,17 @@ import {
   Sparkles,
 } from "lucide-react";
 import { useMirrl } from "@/lib/store";
+import { MemoryStatus, SignInGate } from "@/components/MemoryStatus";
+import { ConsolidateButton } from "@/components/Consolidate";
 
 type View = "grid" | "timeline";
+
+function tierBadge(strength?: number) {
+  const v = strength ?? 0.5;
+  if (v >= 0.66) return { label: "durable", cls: "text-emerald-400 bg-emerald-400/15" };
+  if (v >= 0.33) return { label: "active", cls: "text-[var(--brand-to,#7c5cff)] bg-[color-mix(in_srgb,var(--brand-to,#7c5cff)_18%,transparent)]" };
+  return { label: "faded", cls: "text-muted-2 bg-surface-2" };
+}
 
 function relativeLabel(index: number, total: number) {
   if (total <= 1) return "just now";
@@ -25,7 +33,7 @@ function relativeLabel(index: number, total: number) {
 }
 
 export default function MemoriesPage() {
-  const { memories, addMemory, removeMemory } = useMirrl();
+  const { memories, addMemory, removeMemory, signedIn } = useMirrl();
 
   const [view, setView] = useState<View>("grid");
   const [query, setQuery] = useState("");
@@ -58,6 +66,15 @@ export default function MemoriesPage() {
     addMemory(t);
     setDraft("");
     setComposing(false);
+  }
+
+  if (!signedIn) {
+    return (
+      <SignInGate
+        title="Your memories live here"
+        subtitle="Sign in to see everything Mirrl has learned about you — and prove it's owned by you on 0G."
+      />
+    );
   }
 
   return (
@@ -96,14 +113,8 @@ export default function MemoriesPage() {
               </button>
             </div>
 
-            {/* Sync */}
-            <button
-              type="button"
-              className="flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-sm font-medium text-muted transition-colors hover:bg-surface-2 hover:text-foreground"
-            >
-              <RefreshCw className="h-4 w-4" />
-              Sync
-            </button>
+            {/* Consolidate (elastic brain sweep) */}
+            <ConsolidateButton />
 
             {/* Build memory */}
             <button
@@ -115,6 +126,11 @@ export default function MemoriesPage() {
               Build memory
             </button>
           </div>
+        </div>
+
+        {/* 0G ownership proof */}
+        <div className="mt-4">
+          <MemoryStatus />
         </div>
 
         {/* Inline composer */}
@@ -213,8 +229,13 @@ export default function MemoriesPage() {
                 >
                   <p className="text-sm leading-relaxed text-foreground">{m.text}</p>
                   <div className="mt-3 flex items-center justify-between">
-                    <span className="rounded-lg bg-surface-2 px-2 py-0.5 text-xs font-medium capitalize text-muted">
-                      {m.tag}
+                    <span className="flex items-center gap-1.5">
+                      <span className="rounded-lg bg-surface-2 px-2 py-0.5 text-xs font-medium capitalize text-muted">
+                        {m.tag}
+                      </span>
+                      <span className={`rounded-lg px-2 py-0.5 text-[10px] font-medium ${tierBadge(m.strength).cls}`}>
+                        {m.verified ? "✓ " : ""}{tierBadge(m.strength).label}
+                      </span>
                     </span>
                     <span className="text-xs text-muted-2">
                       {relativeLabel(i, filtered.length)}

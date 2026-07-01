@@ -12,11 +12,14 @@ import {
   Download,
   ListOrdered,
 } from "lucide-react";
+import { ShieldCheck } from "lucide-react";
 import { useMirrl } from "@/lib/store";
 import { MirrlLogo } from "@/components/MirrlLogo";
+import { useMemoryStatus, SignInGate } from "@/components/MemoryStatus";
 
 export default function BrainPage() {
-  const { memories } = useMirrl();
+  const { memories, signedIn } = useMirrl();
+  const { status } = useMemoryStatus();
   const [zoom, setZoom] = useState(1);
 
   const count = memories.length;
@@ -41,6 +44,15 @@ export default function BrainPage() {
     { icon: ListOrdered, label: "List" },
   ];
 
+  if (!signedIn) {
+    return (
+      <SignInGate
+        title="Your brain, visualized"
+        subtitle="Sign in to see your memory as a living graph — every fact Mirrl holds, owned by you on 0G."
+      />
+    );
+  }
+
   return (
     <main
       className="relative flex-1 overflow-hidden"
@@ -50,6 +62,20 @@ export default function BrainPage() {
         backgroundSize: "22px 22px",
       }}
     >
+      {/* 0G ownership overlay */}
+      <div className="absolute left-4 top-4 z-20 flex items-center gap-2 rounded-xl border border-border bg-surface/70 px-3 py-2 text-xs backdrop-blur">
+        <span className="text-foreground"><b>{count}</b> memories</span>
+        <span className="text-muted-2">·</span>
+        {status && status.version > 0 ? (
+          <span className="flex items-center gap-1 text-muted">
+            committed <b className="text-foreground">v{status.version}</b> to 0G
+            {status.live && <ShieldCheck size={12} className="text-emerald-400" />}
+          </span>
+        ) : (
+          <span className="text-muted">not yet on 0G</span>
+        )}
+      </div>
+
       {/* Scalable canvas */}
       <div
         className="absolute inset-0 transition-transform duration-300 ease-out"
@@ -88,20 +114,29 @@ export default function BrainPage() {
         </div>
 
         {/* Memory nodes */}
-        {nodes.map((n) => (
-          <div
-            key={n.id}
-            className="absolute z-10 -translate-x-1/2 -translate-y-1/2"
-            style={{
-              left: `calc(50% + ${n.x}px)`,
-              top: `calc(50% + ${n.y}px)`,
-            }}
-          >
-            <div className="max-w-[140px] truncate rounded-xl border border-border bg-surface px-2.5 py-1.5 text-xs text-foreground">
-              {n.text}
+        {nodes.map((n) => {
+          const s = n.strength ?? 0.5;
+          const durable = s >= 0.66;
+          return (
+            <div
+              key={n.id}
+              className="absolute z-10 -translate-x-1/2 -translate-y-1/2"
+              style={{
+                left: `calc(50% + ${n.x}px)`,
+                top: `calc(50% + ${n.y}px)`,
+                opacity: 0.45 + 0.55 * s, // stronger memories glow brighter
+              }}
+            >
+              <div
+                className={`max-w-[140px] truncate rounded-xl border bg-surface px-2.5 py-1.5 text-xs text-foreground ${
+                  durable ? "border-[var(--brand-to,#7c5cff)]/60 shadow-[0_0_12px_-2px_var(--brand-to,#7c5cff)]" : "border-border"
+                }`}
+              >
+                {n.verified ? "✓ " : ""}{n.text}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
       {/* Tool rail */}
