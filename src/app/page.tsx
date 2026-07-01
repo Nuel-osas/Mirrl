@@ -58,6 +58,12 @@ export default function HomePage() {
     }
   }, [signedIn]);
 
+  // Warm the inference broker as soon as a signed-in user lands, so their first
+  // message doesn't pay the cold broker/ledger/service setup cost.
+  useEffect(() => {
+    if (signedIn) fetch(`/api/chat?net=${network}`).catch(() => {});
+  }, [signedIn, network]);
+
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, sending]);

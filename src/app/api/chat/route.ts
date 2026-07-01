@@ -35,6 +35,15 @@ const ABOUT_MIRRL = `About Mirrl (this platform — answer questions about it fr
 - Sign in with Google, which mints a private custodial 0G wallet; that wallet pays for inference and owns the memory.
 - How it differs from other 0G products: 0G's stack is general-purpose (0G Storage = any data, 0G Compute = any inference, 0G Chain = settlement, 0G DA = data availability). Mirrl is purpose-built for ONE thing on top of that stack — private, user-owned, persistent AI memory. It stores distilled personal context, not raw datasets; the memory follows the user across sessions and (planned) across tools via MCP.
 - Built for The Zero Cup (0G's hackathon).`;
+// Compact identity used on most turns; the full ABOUT_MIRRL is only injected when
+// the user actually asks about the platform — keeps the prompt (and prefill) small.
+const MIRRL_ONELINE =
+  "Mirrl (this app) is a personal AI whose memory the user owns, on 0G: private TEE inference via 0G Compute, memory encrypted on 0G Storage and owned on 0G Chain.";
+const ABOUT_TRIGGER =
+  /\bmirrl\b|\b0g\b|zero\s?g|this (app|platform|thing|product)|who are you|what are you|what can you|how (do|does) (you|this|it)|your memory|own (my|your)|about (you|this|mirrl)/i;
+// Cap how many memories we inject so prefill stays bounded as memory grows.
+const MEMORY_LIMIT = 14;
+
 // 0G deposited into a provider's inference sub-account on first use (min ~1 0G).
 const SUBACCOUNT_FUND = process.env.OG_SUBACCOUNT_FUND ?? "1";
 
@@ -51,38 +60,54 @@ export async function POST(req: NextRequest) {
   const net: Network = network === "mainnet" ? "mainnet" : "testnet";
 
   const session = await readSession();
-  const user = session ? await findUserByGoogleSub(session.sub) : null;
+  // Identity: the Google user (pays for inference) and the cookie uid (keys
+  // memory) are independent lookups — resolve them together.
+  const [user, uid] = await Promise.all([
+    session ? findUserByGoogleSub(session.sub) : Promise.resolve(null),
+    getUserId(),
+  ]);
 
-  // Load memory server-side (committed memory.md from 0G + the pending cache) so
-  // it survives the cache being cleared on commit and never depends on the client.
-  const uid = await getUserId();
-  const mems = await buildMemoryContext(uid);
+  // Kick off the memory load (DB) and provider resolution (0G broker RPCs)
+  // concurrently — neither depends on the other, so we overlap the wait.
+  const memsPromise = buildMemoryContext(uid);
+  const resolvedPromise = user
+    ? resolveProvider(user, net, model).catch((e: unknown) => ({ error: (e as Error).message }))
+    : null;
 
-  // Number memories so the model can cite them inline as [1], [2], …
+  const last = [...(messages || [])].reverse().find((m) => m.role === "user");
+  const mems = (await memsPromise).slice(-MEMORY_LIMIT);
+
+  // Number memories so the model can cite them inline as [1], [2], … Only pull in
+  // the full platform context when the user asks about it, to keep the prompt lean.
   const system: ChatMessage = {
     role: "system",
     content:
       "You are Mirrl — a personal AI whose memory the user truly owns. Be warm, concise and genuinely helpful. " +
       "Format answers in Markdown. When you use something you remember, cite it inline with its number in brackets, e.g. [1].\n\n" +
-      ABOUT_MIRRL +
+      (ABOUT_TRIGGER.test(last?.content ?? "") ? ABOUT_MIRRL : MIRRL_ONELINE) +
       (mems.length ? `\n\nWhat you remember about this user (cite by number):\n${mems.map((m, i) => `[${i + 1}] ${m}`).join("\n")}` : ""),
   };
   const fullMessages = [system, ...(messages || [])];
-  const last = [...(messages || [])].reverse().find((m) => m.role === "user");
   // 0G bills the request over its content and signs the headers against it,
   // so this must match what we actually POST below.
   const billingContent = fullMessages.map((m) => m.content).join("\n");
 
-  // Resolve the live inference target up front; fall back to demo on any failure.
+  // Finish resolving the live target: sign the billing headers over the content.
   let live: Live | null = null;
   let note: string | undefined;
   if (!user) {
     note = "Sign in to run live inference on your own 0G wallet.";
-  } else {
-    try {
-      live = await setupLive(user, net, model, billingContent);
-    } catch (err) {
-      note = `Live inference unavailable (${(err as Error).message}). Deposit 0G into your wallet ${user.wallet_address} to enable it.`;
+  } else if (resolvedPromise) {
+    const r = await resolvedPromise;
+    if ("error" in r) {
+      note = `Live inference unavailable (${r.error}). Deposit 0G into your wallet ${user.wallet_address} to enable it.`;
+    } else {
+      try {
+        const headers = (await r.broker.inference.getRequestHeaders(r.providerAddress, billingContent)) as unknown as Record<string, string>;
+        live = { endpoint: r.endpoint, headers, liveModel: r.liveModel };
+      } catch (err) {
+        note = `Live inference unavailable (${(err as Error).message}). Deposit 0G into your wallet ${user.wallet_address} to enable it.`;
+      }
     }
   }
 
@@ -165,8 +190,53 @@ export async function POST(req: NextRequest) {
   });
 }
 
-// Build the live inference target (broker + funded ledger + provider headers).
-async function setupLive(user: UserRow, net: Network, model?: string, content?: string): Promise<Live> {
+// GET — prime the broker/ledger/service caches so the first chat isn't cold.
+// Safe: it never funds anything (no addLedger / no sub-account transfer).
+export async function GET(req: NextRequest) {
+  const net: Network = req.nextUrl.searchParams.get("net") === "testnet" ? "testnet" : "mainnet";
+  const session = await readSession();
+  const user = session ? await findUserByGoogleSub(session.sub) : null;
+  if (!user) return Response.json({ warm: false });
+  try {
+    await warmProvider(user, net);
+    return Response.json({ warm: true });
+  } catch {
+    return Response.json({ warm: false });
+  }
+}
+
+// Create + cache the broker and prime the service list without spending any 0G.
+async function warmProvider(user: UserRow, net: Network) {
+  const cacheKey = `${net}:${user.wallet_address}`;
+  let entry = brokerCache.get(cacheKey);
+  if (!entry) {
+    const wallet = walletFor(user, new ethers.JsonRpcProvider(rpcFor(net)));
+    const broker = await createZGComputeNetworkBroker(wallet);
+    entry = { broker, wallet, ledgerReady: false, acked: new Set(), funded: new Set(), meta: new Map() };
+    brokerCache.set(cacheKey, entry);
+  }
+  // read-only ledger check — only marks ready if it already exists (never creates it)
+  if (!entry.ledgerReady) {
+    try {
+      await entry.broker.ledger.getLedger();
+      entry.ledgerReady = true;
+    } catch {}
+  }
+  // prime the shared marketplace list
+  if (!(serviceCache && serviceCache.net === net && Date.now() - serviceCache.at < SERVICE_TTL)) {
+    try {
+      const services = await entry.broker.inference.listService();
+      serviceCache = { at: Date.now(), net, services };
+    } catch {}
+  }
+}
+
+type Resolved = { endpoint: string; providerAddress: string; liveModel: string; broker: Broker };
+
+// Resolve the funded provider to run on (broker + ledger + provider metadata).
+// Deliberately omits getRequestHeaders so this can run in parallel with the
+// memory load; the billing headers are signed over the content afterwards.
+async function resolveProvider(user: UserRow, net: Network, model?: string): Promise<Resolved> {
   const cacheKey = `${net}:${user.wallet_address}`;
   let entry = brokerCache.get(cacheKey);
   if (!entry) {
@@ -207,8 +277,7 @@ async function setupLive(user: UserRow, net: Network, model?: string, content?: 
     md = { endpoint: m.endpoint, model: m.model };
     entry.meta.set(providerAddress, md);
   }
-  const headers = (await broker.inference.getRequestHeaders(providerAddress, content ?? "")) as unknown as Record<string, string>;
-  return { endpoint: md.endpoint, headers, liveModel: md.model };
+  return { endpoint: md.endpoint, providerAddress, liveModel: md.model, broker };
 }
 
 type Service = Awaited<ReturnType<Broker["inference"]["listService"]>>[number];
