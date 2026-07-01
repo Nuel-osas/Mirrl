@@ -14,8 +14,8 @@ import { useMirrl } from "@/lib/store";
 
 const NAV = [
   { icon: Home, label: "Home", href: "/", soon: false },
-  { icon: Layers, label: "Memories", href: "/memories", soon: true },
-  { icon: Brain, label: "Brain", href: "/brain", soon: true },
+  { icon: Layers, label: "Memories", href: "/memories", soon: false },
+  { icon: Brain, label: "Brain", href: "/brain", soon: false },
   { icon: Users, label: "Agents", href: "/agents", soon: true },
   { icon: BookOpen, label: "Knowledge", href: "/knowledge", soon: true },
   { icon: Sparkles, label: "Studio", href: "/studio", soon: true },

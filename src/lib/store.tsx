@@ -7,6 +7,8 @@ export type Memory = {
   text: string;
   tag: string;
   createdAt: number;
+  strength?: number; // 0..1 elastic-brain strength
+  verified?: boolean;
 };
 
 export type ChatMsg = { role: "user" | "assistant"; content: string; meta?: string };
@@ -20,6 +22,15 @@ export type ChatSession = {
 
 type Network = "testnet" | "mainnet";
 type Theme = "dark" | "light";
+export type MemoryCommit = {
+  committed?: boolean;
+  rootHash?: string;
+  version?: number;
+  count?: number;
+  live?: boolean;
+  registered?: boolean;
+  note?: string;
+};
 
 type Store = {
   ready: boolean;
@@ -48,7 +59,8 @@ type Store = {
   memories: Memory[];
   addMemory: (text: string, tag?: string) => void;
   removeMemory: (id: string) => void;
-  commitMemory: () => void;
+  reloadMemories: () => Promise<void>;
+  commitMemory: () => Promise<MemoryCommit | null>;
   sessions: ChatSession[];
   activeId: string | null;
   newChat: () => void;
@@ -229,19 +241,30 @@ export function MirrlProvider({ children }: { children: React.ReactNode }) {
     send(`/api/memories?id=${encodeURIComponent(id)}`, "DELETE");
   }, []);
 
-  // Seal the working cache to 0G Storage, then refresh (the cache is now cleared).
-  const commitMemory = useCallback(async () => {
-    if (!signedIn) return;
+  const reloadMemories = useCallback(async () => {
     try {
-      await fetch("/api/memory/commit", {
+      const d = await fetch("/api/memories").then((r) => r.json());
+      setMemories(d.memories ?? []);
+    } catch {}
+  }, []);
+
+  // Seal the working cache to 0G Storage, then refresh (the cache is now cleared).
+  const commitMemory = useCallback(async (): Promise<MemoryCommit | null> => {
+    if (!signedIn) return null;
+    try {
+      const res = await fetch("/api/memory/commit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ network }),
       });
+      const commit = (await res.json()) as MemoryCommit;
       const r = await fetch("/api/memories");
       const d = await r.json();
       setMemories(d.memories ?? []);
-    } catch {}
+      return commit;
+    } catch {
+      return null;
+    }
   }, [signedIn, network]);
 
   // ----- chat sessions -----
@@ -306,7 +329,7 @@ export function MirrlProvider({ children }: { children: React.ReactNode }) {
         signInOpen, openSignIn, closeSignIn, requireAuth,
         claimOpen, openClaim, closeClaim,
         profileOpen, openProfile, closeProfile,
-        model, setModel, memories, addMemory, removeMemory, commitMemory,
+        model, setModel, memories, addMemory, removeMemory, reloadMemories, commitMemory,
         sessions, activeId, newChat, openChat, saveChat, deleteChat,
       }}
     >

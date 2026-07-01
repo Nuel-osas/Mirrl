@@ -34,7 +34,11 @@ export async function buildMemoryContext(uid: string): Promise<string[]> {
   await ensureSchema();
   const doc = await getMemoryDoc(uid);
   const committed = factsFromDoc(doc.content);
-  const pendingRows = (await sql`SELECT text FROM memories WHERE user_id = ${uid} ORDER BY created_at DESC LIMIT 60`) as { text: string }[];
+  // strongest first (elastic-brain strength), then most recent — so durable,
+  // re-confirmed facts win the limited context budget over weak one-offs.
+  const pendingRows = (await sql`
+    SELECT text FROM memories WHERE user_id = ${uid}
+    ORDER BY strength DESC, created_at DESC LIMIT 60`) as { text: string }[];
   const pending = pendingRows.map((p) => p.text);
   const seen = new Set<string>();
   return [...committed, ...pending].filter((t) => {

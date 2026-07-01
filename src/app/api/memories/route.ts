@@ -9,11 +9,18 @@ export async function GET() {
   await ensureSchema();
   const uid = await getUserId();
   const rows = await sql`
-    SELECT id, text, tag, EXTRACT(EPOCH FROM created_at) * 1000 AS created_ms
+    SELECT id, text, tag, strength, verified, EXTRACT(EPOCH FROM created_at) * 1000 AS created_ms
     FROM memories WHERE user_id = ${uid}
     ORDER BY created_at DESC`;
   return NextResponse.json({
-    memories: rows.map((r) => ({ id: r.id, text: r.text, tag: r.tag, createdAt: Number(r.created_ms) })),
+    memories: rows.map((r) => ({
+      id: r.id,
+      text: r.text,
+      tag: r.tag,
+      createdAt: Number(r.created_ms),
+      strength: r.strength == null ? 0.5 : Number(r.strength),
+      verified: Boolean(r.verified),
+    })),
   });
 }
 
