@@ -1,7 +1,10 @@
 import { NextResponse } from "next/server";
+import { cookies } from "next/headers";
 import { verifyGoogleIdToken } from "@/lib/server/google-auth";
 import { findUserByGoogleSub, createUserWithWallet, touchLogin } from "@/lib/server/users";
 import { issueSession } from "@/lib/server/session";
+import { linkAnonToWallet } from "@/lib/db";
+import { UID_COOKIE } from "@/lib/user";
 
 export const runtime = "nodejs";
 export const maxDuration = 30;
@@ -42,6 +45,16 @@ export async function POST(req: Request) {
     isNew = true;
   } else {
     await touchLogin(identity.sub);
+  }
+
+  // Carry any memory built anonymously (under the cookie id) onto the wallet key.
+  const anonUid = (await cookies()).get(UID_COOKIE)?.value;
+  if (anonUid) {
+    try {
+      await linkAnonToWallet(anonUid, user.wallet_address);
+    } catch {
+      // non-fatal — sign-in still succeeds even if migration hiccups
+    }
   }
 
   await issueSession({ sub: identity.sub, email: user.email, wallet: user.wallet_address });

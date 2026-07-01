@@ -90,10 +90,34 @@ export function ensureSchema(): Promise<void> {
         )`;
       // one test-token claim per user
       await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS faucet_claimed_at TIMESTAMPTZ`;
+
+      // Elastic-brain strength model: memories promote when re-confirmed and
+      // decay with disuse, so durable facts surface first and weak ones fade.
+      await sql`ALTER TABLE memories ADD COLUMN IF NOT EXISTS strength REAL NOT NULL DEFAULT 0.5`;
+      await sql`ALTER TABLE memories ADD COLUMN IF NOT EXISTS uses INTEGER NOT NULL DEFAULT 0`;
+      await sql`ALTER TABLE memories ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT false`;
+      await sql`ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_used TIMESTAMPTZ`;
     })().catch((e) => {
       schemaReady = null; // allow retry on a later request
       throw e;
     });
   }
   return schemaReady;
+}
+
+// On sign-in, migrate anything owned by the anonymous cookie id onto the wallet
+// key, so memory/sessions built before signing in follow the user. Runs once per
+// sign-in; wallet-owned rows win over the anon copy (prefs, committed doc).
+export async function linkAnonToWallet(fromUid: string, walletAddress: string): Promise<void> {
+  const to = walletAddress.toLowerCase();
+  if (!fromUid || fromUid === to) return;
+  await ensureSchema();
+  // id-keyed tables → safe to relabel the owner
+  await sql`UPDATE memories SET user_id = ${to} WHERE user_id = ${fromUid}`;
+  await sql`UPDATE chat_sessions SET user_id = ${to} WHERE user_id = ${fromUid}`;
+  // user_id-PK tables → adopt the anon row only if the wallet has none yet
+  await sql`UPDATE user_prefs SET user_id = ${to} WHERE user_id = ${fromUid} AND NOT EXISTS (SELECT 1 FROM user_prefs WHERE user_id = ${to})`;
+  await sql`DELETE FROM user_prefs WHERE user_id = ${fromUid}`;
+  await sql`UPDATE memory_docs SET user_id = ${to} WHERE user_id = ${fromUid} AND NOT EXISTS (SELECT 1 FROM memory_docs WHERE user_id = ${to})`;
+  await sql`DELETE FROM memory_docs WHERE user_id = ${fromUid}`;
 }
