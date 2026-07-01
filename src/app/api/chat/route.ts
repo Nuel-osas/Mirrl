@@ -20,6 +20,7 @@ type BrokerEntry = {
   ledgerReady: boolean;
   acked: Set<string>;
   funded: Set<string>;
+  autofunded: Set<string>;
   meta: Map<string, { endpoint: string; model: string }>;
 };
 const brokerCache = new Map<string, BrokerEntry>();
@@ -44,10 +45,18 @@ const ABOUT_TRIGGER =
 // Cap how many memories we inject so prefill stays bounded as memory grows.
 const MEMORY_LIMIT = 14;
 
-// 0G deposited into a provider's inference sub-account on first use (min ~1 0G).
-const SUBACCOUNT_FUND = process.env.OG_SUBACCOUNT_FUND ?? "1";
+// 0G deposited into a provider's inference sub-account on first use. Providers
+// require a 1 0G minimum *reserve* that can't be spent, so funding exactly 1
+// leaves zero headroom and the first settled fee drops it below the reserve.
+// Fund above the reserve (reserve + usable buffer) so the model actually serves.
+const SUBACCOUNT_FUND = process.env.OG_SUBACCOUNT_FUND ?? "2";
+const FUND_TARGET = ethers.parseEther(SUBACCOUNT_FUND); // top-up destination (~2 0G)
+// A sub-account below this is treated as under-funded → topped up before use. It
+// sits above the provider's 1 0G reserve so a settled fee never drops us under it.
+const FUND_FLOOR = ethers.parseEther("1.2");
 
-type Live = { endpoint: string; headers: Record<string, string>; liveModel: string };
+type Live = { endpoint: string; headers: Record<string, string>; liveModel: string; providerAddress: string };
+type ErrWithStatus = Error & { status?: number };
 
 // Mirrl's brain. Streams the answer token-by-token as NDJSON events:
 //   {type:"meta",mode,model,note?}  {type:"delta",text}  ...  {type:"done"}
@@ -104,7 +113,7 @@ export async function POST(req: NextRequest) {
     } else {
       try {
         const headers = (await r.broker.inference.getRequestHeaders(r.providerAddress, billingContent)) as unknown as Record<string, string>;
-        live = { endpoint: r.endpoint, headers, liveModel: r.liveModel };
+        live = { endpoint: r.endpoint, headers, liveModel: r.liveModel, providerAddress: r.providerAddress };
       } catch (err) {
         note = `Live inference unavailable (${(err as Error).message}). Deposit 0G into your wallet ${user.wallet_address} to enable it.`;
       }
@@ -126,55 +135,109 @@ export async function POST(req: NextRequest) {
           return;
         }
 
-        send({ type: "meta", mode: "live", model: live.liveModel });
-        const res = await fetch(`${live.endpoint}/chat/completions`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", ...live.headers },
-          body: JSON.stringify({ model: live.liveModel, messages: fullMessages, stream: true }),
-        });
-        if (!res.ok) {
-          const errText = (await res.text().catch(() => "")).slice(0, 300);
-          throw new Error(`provider returned ${res.status} ${res.statusText}${errText ? ` — ${errText}` : ""}`);
-        }
-        const reader = res.body?.getReader();
-        if (!reader) throw new Error("no stream body");
-        const dec = new TextDecoder();
-        let buf = "";
-        let raw = "";
-        let emitted = false;
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const chunk = dec.decode(value, { stream: true });
-          raw += chunk;
-          buf += chunk;
-          const lines = buf.split("\n");
-          buf = lines.pop() ?? "";
-          for (const line of lines) {
-            const t = line.trim();
-            if (!t.startsWith("data:")) continue;
-            const data = t.slice(5).trim();
-            if (data === "[DONE]") continue;
+        let anyEmitted = false;
+        const attempt = async (target: Live): Promise<void> => {
+          const res = await fetch(`${target.endpoint}/chat/completions`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...target.headers },
+            body: JSON.stringify({ model: target.liveModel, messages: fullMessages, stream: true }),
+          });
+          if (!res.ok) {
+            const errText = (await res.text().catch(() => "")).slice(0, 300);
+            const e: ErrWithStatus = new Error(`provider returned ${res.status} ${res.statusText}${errText ? ` — ${errText}` : ""}`);
+            e.status = res.status;
+            throw e;
+          }
+          const reader = res.body?.getReader();
+          if (!reader) throw new Error("no stream body");
+          const dec = new TextDecoder();
+          let buf = "";
+          let raw = "";
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = dec.decode(value, { stream: true });
+            raw += chunk;
+            buf += chunk;
+            const lines = buf.split("\n");
+            buf = lines.pop() ?? "";
+            for (const line of lines) {
+              const t = line.trim();
+              if (!t.startsWith("data:")) continue;
+              const data = t.slice(5).trim();
+              if (data === "[DONE]") continue;
+              try {
+                const d = JSON.parse(data)?.choices?.[0]?.delta?.content;
+                if (d) {
+                  send({ type: "delta", text: d });
+                  anyEmitted = true;
+                }
+              } catch {}
+            }
+          }
+          // Some providers ignore stream:true and return one JSON body — recover it.
+          if (!anyEmitted && raw.trim()) {
             try {
-              const d = JSON.parse(data)?.choices?.[0]?.delta?.content;
-              if (d) {
-                send({ type: "delta", text: d });
-                emitted = true;
+              const full = JSON.parse(raw)?.choices?.[0]?.message?.content;
+              if (full) {
+                send({ type: "delta", text: full });
+                anyEmitted = true;
               }
             } catch {}
           }
-        }
-        // Some providers ignore stream:true and return one JSON body — recover it.
-        if (!emitted && raw.trim()) {
+          if (!anyEmitted) throw new Error("the model returned an empty response");
+        };
+
+        // Run the resolved provider. If it fails provider-side (5xx / attestation
+        // crash) before any token, transparently fall back to another provider.
+        const tried = new Set<string>();
+        const failCount = new Map<string, number>();
+        let target: Live | null = live;
+        let announced: string | null = null;
+        let lastErr: ErrWithStatus | null = null;
+        for (let i = 0; i < 4 && target; i++) {
+          if (announced !== target.liveModel) {
+            send({ type: "meta", mode: "live", model: target.liveModel });
+            announced = target.liveModel;
+          }
           try {
-            const full = JSON.parse(raw)?.choices?.[0]?.message?.content;
-            if (full) {
-              send({ type: "delta", text: full });
-              emitted = true;
+            await attempt(target);
+            lastErr = null;
+            break;
+          } catch (e) {
+            lastErr = e as ErrWithStatus;
+            const msg = lastErr.message || "";
+            // Retry on a provider-side crash (5xx / attestation SIGSEGV) OR an
+            // insufficient-balance rejection — never after output already streamed.
+            const balanceIssue = /insufficient balance|minimum is|add more funds/i.test(msg);
+            const retryable = ((!lastErr.status || lastErr.status >= 500) || balanceIssue) && !anyEmitted && !!user;
+            if (!retryable) break;
+
+            // 5xx crashes are transient (the worker restarts) — give the SAME
+            // provider one retry after a backoff before excluding it. Balance
+            // issues can't self-heal, so exclude that provider immediately.
+            const prov = target.providerAddress;
+            const fails = (failCount.get(prov) ?? 0) + 1;
+            failCount.set(prov, fails);
+            if (balanceIssue || fails >= 2) tried.add(prov);
+            await sleep(700); // let a crashed attestation worker come back up
+
+            try {
+              // prefer a provider we haven't exhausted; if all are excluded, take
+              // whatever's live (its worker may have recovered during the backoff)
+              const r2 = await resolveProvider(user!, net, model, tried).catch(() =>
+                resolveProvider(user!, net, model),
+              );
+              const h2 = (await r2.broker.inference.getRequestHeaders(r2.providerAddress, billingContent)) as unknown as Record<string, string>;
+              target = { endpoint: r2.endpoint, headers: h2, liveModel: r2.liveModel, providerAddress: r2.providerAddress };
+            } catch {
+              target = null;
             }
-          } catch {}
+          }
         }
-        if (!emitted) throw new Error("the model returned an empty response — try again or pick another model");
+        if (lastErr && !anyEmitted) {
+          send({ type: "delta", text: `\n\n_${friendlyError(lastErr)}_` });
+        }
         send({ type: "done" });
       } catch (err) {
         send({ type: "delta", text: `\n\n_(stream error: ${(err as Error).message})_` });
@@ -212,7 +275,7 @@ async function warmProvider(user: UserRow, net: Network) {
   if (!entry) {
     const wallet = walletFor(user, new ethers.JsonRpcProvider(rpcFor(net)));
     const broker = await createZGComputeNetworkBroker(wallet);
-    entry = { broker, wallet, ledgerReady: false, acked: new Set(), funded: new Set(), meta: new Map() };
+    entry = { broker, wallet, ledgerReady: false, acked: new Set(), funded: new Set(), autofunded: new Set(), meta: new Map() };
     brokerCache.set(cacheKey, entry);
   }
   // read-only ledger check — only marks ready if it already exists (never creates it)
@@ -236,13 +299,13 @@ type Resolved = { endpoint: string; providerAddress: string; liveModel: string; 
 // Resolve the funded provider to run on (broker + ledger + provider metadata).
 // Deliberately omits getRequestHeaders so this can run in parallel with the
 // memory load; the billing headers are signed over the content afterwards.
-async function resolveProvider(user: UserRow, net: Network, model?: string): Promise<Resolved> {
+async function resolveProvider(user: UserRow, net: Network, model?: string, exclude?: Set<string>): Promise<Resolved> {
   const cacheKey = `${net}:${user.wallet_address}`;
   let entry = brokerCache.get(cacheKey);
   if (!entry) {
     const wallet = walletFor(user, new ethers.JsonRpcProvider(rpcFor(net)));
     const broker = await createZGComputeNetworkBroker(wallet);
-    entry = { broker, wallet, ledgerReady: false, acked: new Set(), funded: new Set(), meta: new Map() };
+    entry = { broker, wallet, ledgerReady: false, acked: new Set(), funded: new Set(), autofunded: new Set(), meta: new Map() };
     brokerCache.set(cacheKey, entry);
   }
   const broker = entry.broker;
@@ -259,7 +322,9 @@ async function resolveProvider(user: UserRow, net: Network, model?: string): Pro
   }
 
   const chat = (services || []).filter(
-    (s) => String(s.serviceType || "").toLowerCase().includes("chat") || !s.serviceType,
+    (s) =>
+      (String(s.serviceType || "").toLowerCase().includes("chat") || !s.serviceType) &&
+      !exclude?.has(String(s.provider)),
   );
   if (chat.length === 0) throw new Error("No inference providers available");
 
@@ -277,17 +342,30 @@ async function resolveProvider(user: UserRow, net: Network, model?: string): Pro
     md = { endpoint: m.endpoint, model: m.model };
     entry.meta.set(providerAddress, md);
   }
+
+  // Move balance-checking to a background timer. Without this the SDK runs an
+  // inline on-chain check-and-fund inside getRequestHeaders on EVERY request
+  // (~7s measured); with it, getRequestHeaders is pure signing (~0.35s).
+  if (!entry.autofunded.has(providerAddress)) {
+    entry.autofunded.add(providerAddress);
+    await broker.inference
+      .startAutoFunding(providerAddress, { interval: 60_000, bufferMultiplier: 2 })
+      .catch(() => entry!.autofunded.delete(providerAddress));
+  }
+
   return { endpoint: md.endpoint, providerAddress, liveModel: md.model, broker };
 }
 
 type Service = Awaited<ReturnType<Broker["inference"]["listService"]>>[number];
 
-// Does this provider's inference sub-account hold enough to serve a request?
+// Does this provider's sub-account hold enough to actually serve a request?
+// Must be ABOVE the reserve floor — an account sitting at/just under the 1 0G
+// reserve (e.g. 0.98) exists but the provider rejects it, so it's NOT funded.
 async function isFunded(broker: Broker, providerAddress: string): Promise<boolean> {
   try {
     const a = (await broker.inference.getAccount(providerAddress)) as unknown as Record<string, unknown> & unknown[];
     const raw = a?.balance ?? a?.[2] ?? a?.[1] ?? "0";
-    return BigInt(String(raw)) >= ethers.parseEther("0.1");
+    return BigInt(String(raw)) >= FUND_FLOOR;
   } catch {
     return false;
   }
@@ -335,22 +413,24 @@ async function ensureLedger(broker: Broker) {
   }
 }
 
-// Create the provider's inference sub-account if it doesn't exist yet.
-// 0G requires a ~1 0G minimum PER provider sub-account, drawn from the ledger's
-// *available* balance. Earlier models lock their 0G in their own sub-accounts,
-// so switching to a NEW model usually finds the ledger's available balance too
-// low. Rather than silently falling back to an already-funded model, we top the
-// ledger up from the user's native wallet, then fund the new sub-account. We
-// only fail (→ fallback) if the wallet itself can't cover it.
+// Ensure the provider's sub-account holds ~FUND_TARGET 0G — creating it if it
+// doesn't exist, or TOPPING UP an existing one that has decayed toward/under the
+// 1 0G reserve (which the provider would otherwise reject). The top-up is drawn
+// from the ledger's available balance, refilled from the native wallet if short.
+// Only fails (→ fallback) if the wallet itself can't cover it.
 async function ensureSubAccount(broker: Broker, wallet: ethers.Wallet, providerAddress: string) {
+  let current = BigInt(0);
   try {
-    await broker.inference.getAccount(providerAddress);
-    return; // already funded — requests auto-top-up from the ledger
+    const a = (await broker.inference.getAccount(providerAddress)) as unknown as Record<string, unknown> & unknown[];
+    current = BigInt(String(a?.balance ?? a?.[2] ?? a?.[1] ?? "0"));
+    if (current >= FUND_FLOOR) return; // already comfortably above the reserve
   } catch {
-    // not found → must create it (min ~1 0G from the ledger's available balance)
+    current = BigInt(0); // doesn't exist yet → create + fund below
   }
 
-  const need = ethers.parseEther(SUBACCOUNT_FUND);
+  // Transfer enough to reach the target from wherever it is now.
+  const need = FUND_TARGET > current ? FUND_TARGET - current : FUND_TARGET;
+
   let available = BigInt(0);
   try {
     const led = (await broker.ledger.getLedger()) as unknown as unknown[];
@@ -359,24 +439,38 @@ async function ensureSubAccount(broker: Broker, wallet: ethers.Wallet, providerA
     // fall through — let the deposit/transfer below surface a real error
   }
 
-  // Top up the ledger from the native wallet when it can't cover this sub-account.
+  // Refill the ledger from the native wallet when it can't cover the transfer.
   if (available < need) {
     const gasBuffer = ethers.parseEther("0.05");
     const nativeBal = await wallet.provider!.getBalance(wallet.address);
-    if (nativeBal < need + gasBuffer) {
+    const deficit = need - available;
+    if (nativeBal < deficit + gasBuffer) {
       throw new Error(
         `Not enough 0G to enable this model — it needs ~${SUBACCOUNT_FUND} 0G. ` +
           `Deposit more 0G into your wallet (${wallet.address}) or claim test tokens.`,
       );
     }
-    // deposit a full sub-account's worth so available >= need with room to spare
-    await broker.ledger.depositFund(Number(SUBACCOUNT_FUND));
+    // deposit a touch over the deficit so available >= need after rounding
+    const depositOg = Math.ceil((Number(ethers.formatEther(deficit)) + 0.05) * 100) / 100;
+    await broker.ledger.depositFund(depositOg);
   }
 
   await broker.ledger.transferFund(providerAddress, "inference", need);
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Turn raw provider/SDK errors into something a person can read (no JSON dumps).
+function friendlyError(e: ErrWithStatus): string {
+  const m = e.message || "";
+  if (/attestation|SIGSEGV|worker exit/i.test(m))
+    return "The 0G compute provider hit a snag (its secure worker restarted). Please send that again.";
+  if (/insufficient balance|minimum is|add more funds/i.test(m))
+    return "That model's balance ran low — top up in Wallet, or pick a model marked “ready.”";
+  if (e.status && e.status >= 500)
+    return "The 0G provider had a temporary error. Please try again in a moment.";
+  return `Something went wrong: ${m.slice(0, 160)}`;
+}
 
 // Split text into word-ish chunks so demo mode "streams" like a real model.
 function* wordChunks(text: string): Generator<string> {
