@@ -4,6 +4,7 @@ import { walletFor, type UserRow } from "@/lib/server/users";
 import { encryptBlob } from "@/lib/server/blobcrypto";
 import { uploadBytes } from "@/lib/server/storage";
 import { rpcFor, type Network } from "@/lib/og";
+import { embed, toVectorLiteral } from "@/lib/server/embed";
 
 export type MemoryDoc = { content: string; rootHash: string | null; version: number; live: boolean };
 
@@ -30,16 +31,37 @@ export async function getMemoryDoc(uid: string): Promise<MemoryDoc> {
 }
 
 // What the model sees: committed long-term memory (from 0G) + the pending cache.
-export async function buildMemoryContext(uid: string): Promise<string[]> {
+// When a query is given, the pending cache is retrieved by MEANING (semantic
+// nearest-neighbour via pgvector) so the most relevant facts win the limited
+// context budget; falls back to strength ordering when there's no query/embeddings.
+export async function buildMemoryContext(uid: string, query?: string): Promise<string[]> {
   await ensureSchema();
   const doc = await getMemoryDoc(uid);
   const committed = factsFromDoc(doc.content);
-  // strongest first (elastic-brain strength), then most recent — so durable,
-  // re-confirmed facts win the limited context budget over weak one-offs.
-  const pendingRows = (await sql`
-    SELECT text FROM memories WHERE user_id = ${uid}
-    ORDER BY strength DESC, created_at DESC LIMIT 60`) as { text: string }[];
-  const pending = pendingRows.map((p) => p.text);
+
+  let pending: string[] = [];
+  const q = query?.trim();
+  if (q) {
+    try {
+      const qvec = toVectorLiteral(await embed(q));
+      // nearest by cosine among embedded memories, with a light strength boost
+      const rows = (await sql`
+        SELECT text FROM memories
+        WHERE user_id = ${uid} AND embedding IS NOT NULL
+        ORDER BY (embedding <=> ${qvec}::vector) - 0.15 * strength ASC
+        LIMIT 16`) as { text: string }[];
+      pending = rows.map((r) => r.text);
+    } catch {
+      // embedding unavailable → fall through to strength ordering
+    }
+  }
+  if (pending.length === 0) {
+    const rows = (await sql`
+      SELECT text FROM memories WHERE user_id = ${uid}
+      ORDER BY strength DESC, created_at DESC LIMIT 16`) as { text: string }[];
+    pending = rows.map((r) => r.text);
+  }
+
   const seen = new Set<string>();
   return [...committed, ...pending].filter((t) => {
     const k = t.toLowerCase();

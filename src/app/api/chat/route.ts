@@ -6,6 +6,7 @@ import { readSession } from "@/lib/server/session";
 import { findUserByGoogleSub, walletFor, type UserRow } from "@/lib/server/users";
 import { getUserId } from "@/lib/user";
 import { buildMemoryContext } from "@/lib/server/memory";
+import { warmEmbed } from "@/lib/server/embed";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -61,10 +62,11 @@ type ErrWithStatus = Error & { status?: number };
 // Mirrl's brain. Streams the answer token-by-token as NDJSON events:
 //   {type:"meta",mode,model,note?}  {type:"delta",text}  ...  {type:"done"}
 export async function POST(req: NextRequest) {
-  const { messages, model, network } = (await req.json()) as {
+  const { messages, model, network, system: systemOverride } = (await req.json()) as {
     messages: ChatMessage[];
     model?: string;
     network?: Network;
+    system?: string; // agents pass a persona prompt; still grounded in recalled memory
   };
   const net: Network = network === "mainnet" ? "mainnet" : "testnet";
 
@@ -76,24 +78,28 @@ export async function POST(req: NextRequest) {
     getUserId(),
   ]);
 
-  // Kick off the memory load (DB) and provider resolution (0G broker RPCs)
-  // concurrently — neither depends on the other, so we overlap the wait.
-  const memsPromise = buildMemoryContext(uid);
+  const last = [...(messages || [])].reverse().find((m) => m.role === "user");
+
+  // Kick off memory recall (semantic — retrieves by meaning of the user's
+  // message) and provider resolution concurrently; neither depends on the other.
+  const memsPromise = buildMemoryContext(uid, last?.content);
   const resolvedPromise = user
     ? resolveProvider(user, net, model).catch((e: unknown) => ({ error: (e as Error).message }))
     : null;
 
-  const last = [...(messages || [])].reverse().find((m) => m.role === "user");
   const mems = (await memsPromise).slice(-MEMORY_LIMIT);
 
   // Number memories so the model can cite them inline as [1], [2], … Only pull in
   // the full platform context when the user asks about it, to keep the prompt lean.
+  const basePersona = systemOverride
+    ? systemOverride // agent persona
+    : "You are Mirrl — a personal AI whose memory the user truly owns. Be warm, concise and genuinely helpful. " +
+      "Format answers in Markdown. When you use something you remember, cite it inline with its number in brackets, e.g. [1].\n\n" +
+      (ABOUT_TRIGGER.test(last?.content ?? "") ? ABOUT_MIRRL : MIRRL_ONELINE);
   const system: ChatMessage = {
     role: "system",
     content:
-      "You are Mirrl — a personal AI whose memory the user truly owns. Be warm, concise and genuinely helpful. " +
-      "Format answers in Markdown. When you use something you remember, cite it inline with its number in brackets, e.g. [1].\n\n" +
-      (ABOUT_TRIGGER.test(last?.content ?? "") ? ABOUT_MIRRL : MIRRL_ONELINE) +
+      basePersona +
       (mems.length ? `\n\nWhat you remember about this user (cite by number):\n${mems.map((m, i) => `[${i + 1}] ${m}`).join("\n")}` : ""),
   };
   const fullMessages = [system, ...(messages || [])];
@@ -257,6 +263,7 @@ export async function POST(req: NextRequest) {
 // Safe: it never funds anything (no addLedger / no sub-account transfer).
 export async function GET(req: NextRequest) {
   const net: Network = req.nextUrl.searchParams.get("net") === "testnet" ? "testnet" : "mainnet";
+  void warmEmbed(); // preload the local embedding model in the background
   const session = await readSession();
   const user = session ? await findUserByGoogleSub(session.sub) : null;
   if (!user) return Response.json({ warm: false });

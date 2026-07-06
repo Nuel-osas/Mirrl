@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { sql, ensureSchema } from "@/lib/db";
 import { getUserId } from "@/lib/user";
+import { embed, toVectorLiteral } from "@/lib/server/embed";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 export async function GET() {
   await ensureSchema();
@@ -29,9 +31,11 @@ export async function POST(req: NextRequest) {
   const uid = await getUserId();
   const { id, text, tag } = (await req.json()) as { id: string; text: string; tag?: string };
   if (!id || !text?.trim()) return NextResponse.json({ error: "missing text" }, { status: 400 });
+  // Embed for semantic recall + memory linking (best-effort; null if it fails).
+  const vec = await embed(text.trim()).catch(() => null);
   await sql`
-    INSERT INTO memories (id, user_id, text, tag)
-    VALUES (${id}, ${uid}, ${text.trim()}, ${tag || "everything"})
+    INSERT INTO memories (id, user_id, text, tag, embedding)
+    VALUES (${id}, ${uid}, ${text.trim()}, ${tag || "everything"}, ${vec ? toVectorLiteral(vec) : null}::vector)
     ON CONFLICT (id) DO NOTHING`;
   return NextResponse.json({ ok: true });
 }

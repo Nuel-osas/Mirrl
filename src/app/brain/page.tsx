@@ -1,137 +1,155 @@
 "use client";
 
-import { useState } from "react";
-import {
-  Maximize,
-  Crosshair,
-  Plus,
-  Minus,
-  Search,
-  RefreshCw,
-  Map,
-  Download,
-  ListOrdered,
-} from "lucide-react";
-import { ShieldCheck } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { forceSimulation, forceManyBody, forceLink, forceCenter, forceCollide, type Simulation } from "d3-force";
+import { Plus, Minus, Crosshair, Trash2, X, ShieldCheck } from "lucide-react";
 import { useMirrl } from "@/lib/store";
-import { MirrlLogo } from "@/components/MirrlLogo";
 import { useMemoryStatus, SignInGate } from "@/components/MemoryStatus";
+import { MirrlLogo } from "@/components/MirrlLogo";
+
+type GNode = {
+  id: string; text: string; tag: string; strength?: number; verified?: boolean;
+  x?: number; y?: number; vx?: number; vy?: number; fx?: number | null; fy?: number | null;
+};
+type SimLink = { source: string; target: string; sim: number };
 
 export default function BrainPage() {
-  const { memories, signedIn } = useMirrl();
+  const { memories, signedIn, removeMemory } = useMirrl();
   const { status } = useMemoryStatus();
-  const [zoom, setZoom] = useState(1);
+  const [rawLinks, setRawLinks] = useState<{ a: string; b: string; sim: number }[]>([]);
+  const [, force] = useState(0);
+  const rerender = () => force((n) => n + 1);
 
-  const count = memories.length;
-  const radius = count > 8 ? 240 : 200;
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const simRef = useRef<Simulation<GNode, SimLink> | null>(null);
+  const nodesRef = useRef<GNode[]>([]);
+  const drag = useRef<{ node: GNode | null; pan: boolean; sx: number; sy: number; ox: number; oy: number }>({ node: null, pan: false, sx: 0, sy: 0, ox: 0, oy: 0 });
+  const [size, setSize] = useState({ w: 900, h: 700 });
+  const [view, setView] = useState({ x: 0, y: 0, k: 1 });
+  const [selected, setSelected] = useState<GNode | null>(null);
 
-  const nodes = memories.map((m, i) => {
-    const angle = i * ((2 * Math.PI) / Math.max(count, 1)) - Math.PI / 2;
-    const x = Math.cos(angle) * radius;
-    const y = Math.sin(angle) * radius;
-    return { ...m, x, y };
-  });
+  useEffect(() => {
+    if (!signedIn) { setRawLinks([]); return; }
+    fetch("/api/memory/links").then((r) => r.json()).then((d) => setRawLinks(d.links ?? [])).catch(() => {});
+  }, [signedIn, memories.length]);
 
-  const tools = [
-    { icon: Maximize, label: "Fullscreen" },
-    { icon: Crosshair, label: "Recenter", onClick: () => setZoom(1) },
-    { icon: Plus, label: "Zoom in", onClick: () => setZoom((z) => Math.min(2, +(z + 0.1).toFixed(2))) },
-    { icon: Minus, label: "Zoom out", onClick: () => setZoom((z) => Math.max(0.5, +(z - 0.1).toFixed(2))) },
-    { icon: Search, label: "Search" },
-    { icon: RefreshCw, label: "Refresh" },
-    { icon: Map, label: "Map" },
-    { icon: Download, label: "Export" },
-    { icon: ListOrdered, label: "List" },
-  ];
+  useEffect(() => {
+    const el = wrapRef.current; if (!el) return;
+    const ro = new ResizeObserver(() => setSize({ w: el.clientWidth, h: el.clientHeight }));
+    ro.observe(el); return () => ro.disconnect();
+  }, []);
+
+  // build / update the force simulation, preserving positions of existing nodes
+  useEffect(() => {
+    const prev = new Map(nodesRef.current.map((n) => [n.id, n]));
+    const nodes: GNode[] = memories.map((m) =>
+      Object.assign(prev.get(m.id) ?? { id: m.id }, { text: m.text, tag: m.tag, strength: m.strength, verified: m.verified }),
+    );
+    nodesRef.current = nodes;
+    const links: SimLink[] = rawLinks.map((l) => ({ source: l.a, target: l.b, sim: l.sim }));
+
+    simRef.current?.stop();
+    const sim = forceSimulation<GNode>(nodes)
+      .force("charge", forceManyBody().strength(-340))
+      .force("link", forceLink<GNode, SimLink>(links).id((d) => d.id).distance((d) => 150 - 80 * d.sim).strength((d) => 0.2 + 0.6 * d.sim))
+      .force("center", forceCenter(0, 0).strength(0.045))
+      .force("collide", forceCollide(54))
+      .alpha(0.9).restart()
+      .on("tick", rerender);
+    simRef.current = sim;
+    return () => { sim.stop(); };
+  }, [memories, rawLinks]);
 
   if (!signedIn) {
-    return (
-      <SignInGate
-        title="Your brain, visualized"
-        subtitle="Sign in to see your memory as a living graph — every fact Mirrl holds, owned by you on 0G."
-      />
-    );
+    return <SignInGate title="Your brain, visualized" subtitle="Sign in to explore your memory as a living, connected graph — owned by you on 0G." />;
   }
+
+  const cx = size.w / 2 + view.x;
+  const cy = size.h / 2 + view.y;
+  const nodes = nodesRef.current;
+  const byId = (id: string) => nodes.find((n) => n.id === id);
+  const toSim = (clientX: number, clientY: number) => {
+    const r = wrapRef.current!.getBoundingClientRect();
+    return { x: (clientX - r.left - cx) / view.k, y: (clientY - r.top - cy) / view.k };
+  };
+
+  const nodeDown = (e: React.PointerEvent, n: GNode) => {
+    e.stopPropagation();
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+    drag.current.node = n;
+    simRef.current?.alphaTarget(0.3).restart();
+    const p = toSim(e.clientX, e.clientY);
+    n.fx = p.x; n.fy = p.y;
+  };
+  const bgDown = (e: React.PointerEvent) => {
+    drag.current = { ...drag.current, pan: true, sx: e.clientX, sy: e.clientY, ox: view.x, oy: view.y };
+  };
+  const move = (e: React.PointerEvent) => {
+    const d = drag.current;
+    if (d.node) { const p = toSim(e.clientX, e.clientY); d.node.fx = p.x; d.node.fy = p.y; }
+    else if (d.pan) setView((v) => ({ ...v, x: d.ox + (e.clientX - d.sx), y: d.oy + (e.clientY - d.sy) }));
+  };
+  const up = () => {
+    if (drag.current.node) { drag.current.node.fx = null; drag.current.node.fy = null; simRef.current?.alphaTarget(0); }
+    drag.current.node = null; drag.current.pan = false;
+  };
+  const zoom = (f: number) => setView((v) => ({ ...v, k: Math.min(2.2, Math.max(0.4, +(v.k * f).toFixed(2))) }));
 
   return (
     <main
-      className="relative flex-1 overflow-hidden"
-      style={{
-        backgroundImage:
-          "radial-gradient(circle, rgba(255,255,255,0.06) 1px, transparent 1px)",
-        backgroundSize: "22px 22px",
-      }}
+      ref={wrapRef}
+      className="relative flex-1 touch-none select-none overflow-hidden bg-black"
+      style={{ backgroundImage: "radial-gradient(circle, rgba(255,255,255,0.05) 1px, transparent 1px)", backgroundSize: "24px 24px", cursor: drag.current.pan ? "grabbing" : "default" }}
+      onPointerDown={bgDown}
+      onPointerMove={move}
+      onPointerUp={up}
+      onPointerLeave={up}
+      onWheel={(e) => zoom(e.deltaY < 0 ? 1.1 : 0.9)}
     >
       {/* 0G ownership overlay */}
       <div className="absolute left-4 top-4 z-20 flex items-center gap-2 rounded-xl border border-border bg-surface/70 px-3 py-2 text-xs backdrop-blur">
-        <span className="text-foreground"><b>{count}</b> memories</span>
+        <span className="text-foreground"><b>{nodes.length}</b> memories</span>
         <span className="text-muted-2">·</span>
         {status && status.version > 0 ? (
-          <span className="flex items-center gap-1 text-muted">
-            committed <b className="text-foreground">v{status.version}</b> to 0G
-            {status.live && <ShieldCheck size={12} className="text-emerald-400" />}
-          </span>
+          <span className="flex items-center gap-1 text-muted">committed <b className="text-foreground">v{status.version}</b> to 0G {status.live && <ShieldCheck size={12} className="text-emerald-400" />}</span>
         ) : (
           <span className="text-muted">not yet on 0G</span>
         )}
+        <span className="text-muted-2">·</span>
+        <span className="text-muted-2">drag to move · scroll to zoom</span>
       </div>
 
-      {/* Scalable canvas */}
-      <div
-        className="absolute inset-0 transition-transform duration-300 ease-out"
-        style={{ transform: `scale(${zoom})` }}
-      >
-        {/* Connector lines */}
-        {count > 0 && (
-          <svg className="pointer-events-none absolute inset-0 h-full w-full">
-            {nodes.map((n) => (
-              <line
-                key={`line-${n.id}`}
-                x1="50%"
-                y1="50%"
-                x2={`calc(50% + ${n.x}px)`}
-                y2={`calc(50% + ${n.y}px)`}
-                stroke="rgba(255,255,255,0.08)"
-                strokeWidth={1}
-              />
-            ))}
-          </svg>
-        )}
+      {/* transformed world: links + core + nodes share one coordinate space */}
+      <div className="absolute inset-0" style={{ transform: `translate(${cx}px, ${cy}px) scale(${view.k})`, transformOrigin: "0 0" }}>
+        <svg className="pointer-events-none absolute overflow-visible" style={{ left: 0, top: 0, width: 1, height: 1 }}>
+          {rawLinks.map((l, i) => {
+            const a = byId(l.a); const b = byId(l.b);
+            if (!a || a.x == null || !b || b.x == null) return null;
+            return <line key={i} x1={a.x} y1={a.y!} x2={b.x} y2={b.y!} stroke={`rgba(124,92,255,${Math.min(0.75, 0.25 + l.sim)})`} strokeWidth={0.8 + l.sim * 2.2} />;
+          })}
+          {nodes.map((n) => n.x != null && <line key={`c-${n.id}`} x1={0} y1={0} x2={n.x} y2={n.y!} stroke="rgba(255,255,255,0.04)" strokeWidth={1} />)}
+        </svg>
 
-        {/* Centered memory node */}
-        <div className="absolute left-1/2 top-1/2 z-10 -translate-x-1/2 -translate-y-1/2">
-          {/* Glow */}
-          <div className="pointer-events-none absolute left-1/2 top-1/2 h-64 w-64 -translate-x-1/2 -translate-y-1/2 rounded-full bg-purple-500/20 blur-3xl" />
-          <div className="relative flex flex-col items-center gap-2">
-            <div className="flex h-16 w-16 items-center justify-center rounded-full border border-border-strong bg-surface text-foreground brand-grad">
-              <MirrlLogo size={28} />
-            </div>
-            <div className="text-center">
-              <p className="text-sm text-muted">your memory</p>
-              <p className="text-xs text-muted-2">{count} memories</p>
-            </div>
-          </div>
+        {/* central core */}
+        <div className="absolute -translate-x-1/2 -translate-y-1/2" style={{ left: 0, top: 0 }}>
+          <div className="pointer-events-none absolute left-1/2 top-1/2 h-40 w-40 -translate-x-1/2 -translate-y-1/2 rounded-full bg-purple-500/20 blur-3xl" />
+          <div className="relative flex h-14 w-14 items-center justify-center rounded-full brand-grad"><MirrlLogo size={26} /></div>
         </div>
 
-        {/* Memory nodes */}
+        {/* memory nodes (draggable) */}
         {nodes.map((n) => {
+          if (n.x == null) return null;
           const s = n.strength ?? 0.5;
           const durable = s >= 0.66;
           return (
             <div
               key={n.id}
-              className="absolute z-10 -translate-x-1/2 -translate-y-1/2"
-              style={{
-                left: `calc(50% + ${n.x}px)`,
-                top: `calc(50% + ${n.y}px)`,
-                opacity: 0.45 + 0.55 * s, // stronger memories glow brighter
-              }}
+              className="absolute -translate-x-1/2 -translate-y-1/2 cursor-grab active:cursor-grabbing"
+              style={{ left: n.x, top: n.y, opacity: 0.5 + 0.5 * s }}
+              onPointerDown={(e) => nodeDown(e, n)}
+              onClick={(e) => { e.stopPropagation(); setSelected(n); }}
             >
-              <div
-                className={`max-w-[140px] truncate rounded-xl border bg-surface px-2.5 py-1.5 text-xs text-foreground ${
-                  durable ? "border-[var(--brand-to,#7c5cff)]/60 shadow-[0_0_12px_-2px_var(--brand-to,#7c5cff)]" : "border-border"
-                }`}
-              >
+              <div className={`max-w-[130px] truncate rounded-xl border bg-surface px-2.5 py-1.5 text-xs text-foreground ${durable ? "border-[var(--brand-to,#7c5cff)]/70 shadow-[0_0_14px_-2px_var(--brand-to,#7c5cff)]" : "border-border"}`}>
                 {n.verified ? "✓ " : ""}{n.text}
               </div>
             </div>
@@ -139,32 +157,33 @@ export default function BrainPage() {
         })}
       </div>
 
-      {/* Tool rail */}
-      <div className="absolute right-4 top-1/2 z-20 -translate-y-1/2">
-        <div className="flex flex-col gap-0.5 rounded-2xl border border-border bg-surface/70 p-1.5 backdrop-blur">
-          {tools.map((t, i) => {
-            const Icon = t.icon;
-            return (
-              <div key={t.label}>
-                <button
-                  type="button"
-                  aria-label={t.label}
-                  onClick={t.onClick}
-                  className="rounded-lg p-2 text-muted transition-colors hover:bg-surface-2 hover:text-foreground"
-                >
-                  <Icon size={16} />
-                </button>
-                {/* Zoom % between Plus and Minus */}
-                {i === 2 && (
-                  <p className="py-0.5 text-center text-[10px] text-muted-2">
-                    {Math.round(zoom * 100)}%
-                  </p>
-                )}
-              </div>
-            );
-          })}
-        </div>
+      {/* zoom controls */}
+      <div className="absolute right-4 top-1/2 z-20 -translate-y-1/2 flex flex-col gap-0.5 rounded-2xl border border-border bg-surface/70 p-1.5 backdrop-blur">
+        <button onClick={() => zoom(1.15)} className="rounded-lg p-2 text-muted hover:bg-surface-2 hover:text-foreground"><Plus size={16} /></button>
+        <p className="py-0.5 text-center text-[10px] text-muted-2">{Math.round(view.k * 100)}%</p>
+        <button onClick={() => zoom(0.87)} className="rounded-lg p-2 text-muted hover:bg-surface-2 hover:text-foreground"><Minus size={16} /></button>
+        <button onClick={() => setView({ x: 0, y: 0, k: 1 })} className="rounded-lg p-2 text-muted hover:bg-surface-2 hover:text-foreground"><Crosshair size={16} /></button>
       </div>
+
+      {/* detail card */}
+      {selected && (
+        <div className="absolute bottom-4 left-1/2 z-30 w-[min(24rem,calc(100vw-2rem))] -translate-x-1/2 rounded-2xl border border-border-strong bg-surface p-4 shadow-2xl">
+          <button onClick={() => setSelected(null)} className="absolute right-3 top-3 text-muted-2 hover:text-foreground"><X size={16} /></button>
+          <p className="pr-6 text-sm text-foreground">{selected.text}</p>
+          <div className="mt-3 flex items-center gap-2">
+            <span className="rounded-full bg-surface-2 px-2 py-0.5 text-[11px] capitalize text-muted">{selected.tag}</span>
+            <span className="rounded-full bg-surface-2 px-2 py-0.5 text-[11px] text-muted">
+              {(selected.strength ?? 0.5) >= 0.66 ? "durable" : (selected.strength ?? 0.5) >= 0.33 ? "active" : "faded"}
+            </span>
+            <button
+              onClick={() => { removeMemory(selected.id); setSelected(null); }}
+              className="ml-auto flex items-center gap-1 rounded-lg px-2 py-1 text-xs text-red-400 hover:bg-red-400/10"
+            >
+              <Trash2 size={13} /> Forget
+            </button>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

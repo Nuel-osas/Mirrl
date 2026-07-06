@@ -97,6 +97,25 @@ export function ensureSchema(): Promise<void> {
       await sql`ALTER TABLE memories ADD COLUMN IF NOT EXISTS uses INTEGER NOT NULL DEFAULT 0`;
       await sql`ALTER TABLE memories ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT false`;
       await sql`ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_used TIMESTAMPTZ`;
+
+      // Semantic layer: a 384-dim embedding per memory (pgvector) powers
+      // meaning-based recall and memory-to-memory linking in the Brain.
+      await sql`CREATE EXTENSION IF NOT EXISTS vector`;
+      await sql`ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(384)`;
+      await sql`CREATE INDEX IF NOT EXISTS memories_embed_idx ON memories USING hnsw (embedding vector_cosine_ops)`;
+
+      // Agents: tasks worked by persona agents, grounded in the owned memory.
+      await sql`
+        CREATE TABLE IF NOT EXISTS agent_tasks (
+          id           text PRIMARY KEY,
+          user_id      text NOT NULL,
+          goal         text NOT NULL,
+          assigned     text NOT NULL DEFAULT 'agent_researcher',
+          status       text NOT NULL DEFAULT 'open',
+          observations jsonb NOT NULL DEFAULT '[]'::jsonb,
+          updated_at   timestamptz NOT NULL DEFAULT now()
+        )`;
+      await sql`CREATE INDEX IF NOT EXISTS agent_tasks_user_idx ON agent_tasks (user_id, updated_at DESC)`;
     })().catch((e) => {
       schemaReady = null; // allow retry on a later request
       throw e;
