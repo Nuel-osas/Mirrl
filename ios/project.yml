@@ -1,0 +1,41 @@
+name: Mirrl
+options:
+  bundleIdPrefix: com.mirrl
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+packages:
+  GoogleSignIn:
+    url: https://github.com/google/GoogleSignIn-iOS
+    from: 7.1.0
+targets:
+  Mirrl:
+    type: application
+    platform: iOS
+    sources:
+      - path: Mirrl
+    dependencies:
+      - package: GoogleSignIn
+        product: GoogleSignIn
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.mirrl.app
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_VERSION: "5.0"
+        # Keychain entitlement so GoogleSignIn's token cache works (no keychain error).
+        CODE_SIGN_ENTITLEMENTS: Mirrl/Mirrl.entitlements
+    info:
+      path: Mirrl/Info.plist
+      properties:
+        CFBundleDisplayName: Mirrl
+        UILaunchScreen: {}
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        # === Google sign-in (iOS OAuth client) ===
+        GIDClientID: 626577489375-aq7v2pias7tu6ea39dikg2fqr7sbis5g.apps.googleusercontent.com
+        CFBundleURLTypes:
+          - CFBundleURLSchemes:
+              - com.googleusercontent.apps.626577489375-aq7v2pias7tu6ea39dikg2fqr7sbis5g
