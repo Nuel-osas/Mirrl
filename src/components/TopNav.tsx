@@ -16,7 +16,7 @@ const NAV = [
   { icon: Home, label: "Home", href: "/", soon: false },
   { icon: Layers, label: "Memories", href: "/memories", soon: false },
   { icon: Brain, label: "Brain", href: "/brain", soon: false },
-  { icon: Users, label: "Agents", href: "/agents", soon: true },
+  { icon: Users, label: "Agents", href: "/agents", soon: false },
   { icon: BookOpen, label: "Knowledge", href: "/knowledge", soon: true },
   { icon: Sparkles, label: "Studio", href: "/studio", soon: true },
   { icon: LayoutGrid, label: "Integrations", href: "/integrations", soon: false },
