@@ -11,12 +11,15 @@ export type GoogleIdentity = {
 
 /** Verify a Google ID token (JWT) against Google's published JWKS. */
 export async function verifyGoogleIdToken(idToken: string): Promise<GoogleIdentity> {
-  const clientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ?? process.env.GOOGLE_CLIENT_ID;
-  if (!clientId) throw new Error("NEXT_PUBLIC_GOOGLE_CLIENT_ID not set");
+  const webClientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ?? process.env.GOOGLE_CLIENT_ID;
+  // iOS tokens carry the iOS OAuth client id as their audience — accept it too.
+  const iosClientId = process.env.GOOGLE_IOS_CLIENT_ID;
+  const audience = [webClientId, iosClientId].filter(Boolean) as string[];
+  if (audience.length === 0) throw new Error("No Google client id configured");
 
   const { payload } = await jwtVerify(idToken, GOOGLE_JWKS, {
     issuer: ["https://accounts.google.com", "accounts.google.com"],
-    audience: clientId,
+    audience,
   });
 
   const sub = String(payload.sub ?? "");

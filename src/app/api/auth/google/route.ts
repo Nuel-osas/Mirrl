@@ -57,7 +57,7 @@ export async function POST(req: Request) {
     }
   }
 
-  await issueSession({ sub: identity.sub, email: user.email, wallet: user.wallet_address });
+  const token = await issueSession({ sub: identity.sub, email: user.email, wallet: user.wallet_address });
 
   return NextResponse.json({
     address: user.wallet_address,
@@ -65,5 +65,6 @@ export async function POST(req: Request) {
     name: user.name,
     picture: user.picture,
     isNew,
+    token, // native clients store this and send it as `Authorization: Bearer`
   });
 }
